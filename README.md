@@ -134,7 +134,7 @@ fluxwave serve ./chunks --host 0.0.0.0 --port 8765 --peer-id node-a
 Download from one peer:
 
 ~~~bash
-fluxwave download http://192.168.1.10:8765 ./received --workers 4
+fluxwave download ./received --peer http://192.168.1.10:8765 --workers 4
 ~~~
 
 Download from multiple peers:
@@ -155,7 +155,7 @@ fluxwave download ./received
 For a self-signed TLS peer in a controlled test:
 
 ~~~bash
-fluxwave download https://192.168.1.10:8765 ./received --insecure
+fluxwave download ./received --peer https://192.168.1.10:8765 --insecure
 ~~~
 
 ## Real large-file benchmark

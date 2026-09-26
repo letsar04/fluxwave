@@ -4,7 +4,7 @@
 
 FluxWave treats a large file as a set of verified fragments and chooses transfer actions using destination state, peer availability, expected transfer cost, failure risk, and reconstructibility.
 
-> Research/engineering prototype. The network stack is suitable for controlled LAN experiments; do not expose a peer directly to the public Internet without an additional security layer and operational hardening.
+> **Enterprise-testable LAN prototype.** The secure CLI requires TLS and peer authentication by default. It is not yet a public Internet service and is not certified against any compliance standard.
 
 ## Implemented transfer stack
 
@@ -13,17 +13,66 @@ FluxWave treats a large file as a set of verified fragments and chooses transfer
 - destination-side resume;
 - persistent HTTP/1.1 connections;
 - concurrent multi-peer transfer;
+- bearer-token peer authentication;
+- TLS 1.2+ transport;
 - checksum verification before a chunk becomes final;
 - retry on another peer after a failed transfer;
+- bounded manifest and connection resources;
+- path-boundary checks against traversal;
 - per-peer throughput/failure measurements;
 - AIMD congestion control for per-peer concurrency;
-- optional TLS 1.2+ transport;
 - LAN multicast peer discovery;
 - content-addressed local chunk store;
 - dependency-aware reconstruction planning;
 - WARP scheduling and real XOR parity;
 - reproducible simulation benchmarks;
-- a real large-file benchmark over local TCP sockets.
+- a real large-file benchmark over local TCP sockets;
+- CI unit/integration tests, Bandit static analysis and pip-audit dependency checks.
+
+## Security model
+
+Security is a release gate. The secure CLI:
+
+1. refuses plaintext HTTP unless `--insecure-http` is explicitly selected;
+2. binds to `127.0.0.1` by default;
+3. requires an authentication token for serving;
+4. validates TLS certificates by default on the client;
+5. rejects credentials embedded in peer URLs;
+6. rejects path traversal attempts;
+7. verifies SHA-256 before committing downloaded chunks;
+8. bounds manifest size and peer connection concurrency;
+9. uses socket timeouts and does not expose Python's default server identity.
+
+Read the full threat model and operational requirements in `SECURITY.md` and the test matrix in `SECURITY_TEST_PLAN.md`.
+
+### Secure pilot setup
+
+Generate or obtain a certificate from your enterprise PKI. For an isolated test only, OpenSSL can create a short-lived certificate:
+
+~~~bash
+openssl req -x509 -newkey rsa:2048 -nodes -days 30 \\
+  -keyout server.key -out server.crt -subj "/CN=fluxwave"
+~~~
+
+Create a token in a secret manager or protected file. Do not commit it and do not place it in a URL.
+
+~~~bash
+set FLUXWAVE_AUTH_TOKEN=replace-with-a-long-random-secret
+~~~
+
+Then serve only the intended chunk directory:
+
+~~~bash
+fluxwave serve C:\fluxwave\chunks \\
+  --host 10.0.0.20 \\
+  --port 8765 \\
+  --certfile C:\fluxwave\server.crt \\
+  --keyfile C:\fluxwave\server.key
+~~~
+
+The client can use the same secret through `FLUXWAVE_AUTH_TOKEN` or an `--auth-token-file`. Certificate verification remains enabled by default.
+
+**Never use `--insecure` or `--insecure-http` for an enterprise deployment.**
 
 ## Architecture
 
@@ -50,7 +99,7 @@ peer discovery       destination state
               |
       persistent HTTP/1.1
               |
-        TLS (optional)
+         TLS + auth
               |
        verified chunks
               |
@@ -59,25 +108,7 @@ peer discovery       destination state
 
 ## Persistent connections
 
-PersistentPeerClient uses HTTP/1.1 keep-alive and retains one connection per worker thread. A transfer therefore does not need a new TCP/TLS handshake for every chunk.
-
-## TLS
-
-For a local test certificate, OpenSSL can generate one with:
-
-~~~bash
-openssl req -x509 -newkey rsa:2048 -nodes -days 30 \\
-  -keyout server.key -out server.crt -subj "/CN=fluxwave"
-~~~
-
-A peer can then run with the certificate and private key:
-
-~~~bash
-fluxwave serve ./chunks --host 0.0.0.0 --port 8765 \
-  --certfile server.crt --keyfile server.key
-~~~
-
-The downloader validates certificates by default. The --insecure option is available for controlled self-signed/LAN experiments only.
+`PersistentPeerClient` uses HTTP/1.1 keep-alive and retains one connection per worker thread. A transfer therefore does not need a new TCP/TLS handshake for every chunk.
 
 ## Peer discovery
 
@@ -87,13 +118,7 @@ FluxWave uses UDP multicast on the local network:
 fluxwave discover --timeout 5
 ~~~
 
-A peer can announce itself while serving:
-
-~~~bash
-fluxwave serve ./chunks --port 8765 --peer-id node-a --advertise
-~~~
-
-Discovery is intentionally LAN-scoped. It is not a replacement for an authenticated Internet rendezvous service.
+Discovery is a locator, not an authentication mechanism. Every discovered peer must still be authenticated before it is trusted for data transfer.
 
 ## Failure recovery
 
@@ -132,38 +157,29 @@ Reconstruct and verify:
 fluxwave reconstruct ./chunks ./chunks/manifest.json restored.mp4
 ~~~
 
-Serve:
+Secure serving:
 
 ~~~bash
-fluxwave serve ./chunks --host 0.0.0.0 --port 8765 --peer-id node-a
+fluxwave serve ./chunks \\
+  --host 10.0.0.20 \\
+  --port 8765 \\
+  --certfile server.crt \\
+  --keyfile server.key \\
+  --auth-token-file C:\\secrets\\fluxwave.token
 ~~~
 
-Download from one peer:
+Download from one or more authenticated peers:
 
 ~~~bash
-fluxwave download ./received --peer http://192.168.1.10:8765 --workers 4
+fluxwave download ./received \\
+  --peer https://10.0.0.20:8765 \\
+  --peer https://10.0.0.21:8765 \\
+  --workers 4 \\
+  --retries 3 \\
+  --auth-token-file C:\\secrets\\fluxwave.token
 ~~~
 
-Download from multiple peers:
-
-~~~bash
-fluxwave download http://192.168.1.10:8765 ./received \
-  --peer http://192.168.1.11:8765 \
-  --peer http://192.168.1.12:8765 \
-  --workers 4 --retries 3
-~~~
-
-Or let discovery find peers:
-
-~~~bash
-fluxwave download ./received
-~~~
-
-For a self-signed TLS peer in a controlled test:
-
-~~~bash
-fluxwave download ./received --peer https://192.168.1.10:8765 --insecure
-~~~
+For isolated development only, plaintext HTTP can be explicitly enabled with `--insecure-http`; this is intentionally not the default.
 
 ## Real large-file benchmark
 
@@ -173,26 +189,9 @@ The benchmark creates a deterministic file, chunks it, starts two local TCP peer
 python benchmarks/real_large_transfer.py --size-mib 128 --chunk-mib 4
 ~~~
 
-Output format:
-
-~~~text
-file_mib=128
-chunk_mib=4
-one_peer_seconds=...
-two_peer_seconds=...
-speedup=...x
-sha256_ok=True
-~~~
-
 The benchmark reports measurements rather than promising a fixed speedup. Results depend on CPU, filesystem, operating system, socket buffers, and machine topology.
 
 ## Reconstruction model
-
-A target can have logical rules such as:
-
-~~~text
-F3 = reconstruct(F1, F2)
-~~~
 
 WARP compares direct transfer with the cost of fetching missing prerequisites plus CPU reconstruction cost.
 
@@ -204,24 +203,38 @@ P = F1 XOR F2 XOR ... XOR Fn
 
 One missing fragment can therefore be recovered from parity and the remaining fragments.
 
-## Limitations
+## Enterprise test gate
 
-FluxWave is not yet a public Internet file-sharing service. Production deployment still requires:
+Before a pilot, run the full test suite and security gates locally or in CI:
 
-- authenticated peer identity and certificate provisioning;
-- a trusted rendezvous/discovery service outside the LAN;
-- stronger abuse and rate controls;
+~~~bash
+python -m pytest -q
+bandit -q -r fluxwave
+pip-audit
+python benchmarks/real_large_transfer.py --size-mib 128 --chunk-mib 4
+~~~
+
+For the full enterprise test matrix, see `SECURITY_TEST_PLAN.md`.
+
+## Limitations and residual risk
+
+FluxWave is not yet a public Internet file-sharing service. Remaining production work includes:
+
+- mutual TLS or an enterprise identity provider instead of bearer-only peer identity;
+- signed manifests and stronger end-to-end sender authenticity;
+- a trusted rendezvous service for cross-network discovery;
 - persistent transfer-session metadata across process restarts;
-- more sophisticated erasure coding than single XOR parity;
+- stronger rate limiting and abuse controls;
+- richer erasure coding than single XOR parity;
 - network-wide congestion modelling;
-- benchmark runs on geographically separated machines;
+- geographically separated benchmark runs;
 - formal protocol/version compatibility;
-- security review.
+- independent penetration testing and security review.
 
-Individual ingredients used by FluxWave—content addressing, chunked transfer, peer-to-peer scheduling, HTTP keep-alive, TLS, multicast discovery, and XOR/erasure coding—are established techniques. The research question is whether their combination, guided by reconstruction cost and destination state, produces measurable benefits for large transfers.
+Individual ingredients used by FluxWave are established techniques. The research/product hypothesis is whether their combination, guided by destination state and reconstruction cost, produces measurable benefits for large transfers.
 
 ## Status
 
-**Phase 3 — usable LAN transfer prototype**
+**Phase 4 — enterprise pilot candidate for controlled networks**
 
-The project now covers the experimental path from chunking to multi-peer transfer, TLS, discovery, recovery, congestion control, reconstruction, and real large-file benchmarking. The next step is protocol hardening and validation on heterogeneous real networks.
+The repository now has secure-by-default CLI behavior, authentication, TLS, security regression tests, static security/dependency gates, failure recovery, multi-peer transfer and real large-file benchmarks. The next release gate is a multi-machine enterprise pilot plus independent penetration testing before any public Internet exposure.

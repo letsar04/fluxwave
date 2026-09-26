@@ -180,148 +180,119 @@ class FluxWaveHTTPServer:
         certfile: str | Path | None = None,
         keyfile: str | Path | None = None,
         auth_token: str | None = None,
-        max_connections: int = 32,
+        max_connections: int = 64,
     ) -> None:
         self.chunks_dir = Path(chunks_dir).resolve()
         self.host = host
         self.port = port
         self.peer_id = peer_id
-        self.certfile = str(certfile) if certfile else None
-        self.keyfile = str(keyfile) if keyfile else None
+        self.certfile = Path(certfile) if certfile else None
+        self.keyfile = Path(keyfile) if keyfile else None
         self.auth_token = auth_token
         self.max_connections = max_connections
-        if bool(self.certfile) != bool(self.keyfile):
-            raise ValueError("certfile and keyfile must be supplied together")
-        if not self.peer_id or len(self.peer_id) > MAX_PEER_ID_LENGTH:
-            raise ValueError("peer_id is invalid")
-        if max_connections <= 0:
-            raise ValueError("max_connections must be positive")
-        self._server: ThreadingHTTPServer | None = None
+        self._httpd: ThreadingHTTPServer | None = None
+        self._semaphore = threading.BoundedSemaphore(max_connections)
 
     def start(self) -> ThreadingHTTPServer:
-        directory = self.chunks_dir
+        chunks_dir = self.chunks_dir
         peer_id = self.peer_id
         auth_token = self.auth_token
+        semaphore = self._semaphore
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
-            server_version = "FluxWave"
-            sys_version = ""
-
-            def setup(self) -> None:
-                super().setup()
-                self.connection.settimeout(60.0)
 
             def _authorized(self) -> bool:
-                if not auth_token:
+                if auth_token is None:
                     return True
-                supplied = self.headers.get("Authorization", "")
-                prefix = "Bearer "
-                if not supplied.startswith(prefix):
-                    return False
-                return hmac.compare_digest(supplied[len(prefix):], auth_token)
+                presented = self.headers.get("Authorization", "")
+                expected = f"Bearer {auth_token}"
+                return hmac.compare_digest(presented, expected)
 
-            def do_GET(self) -> None:
-                if not self._authorized():
-                    self.send_response(401)
-                    self.send_header("WWW-Authenticate", "Bearer")
-                    self.send_header("Content-Length", "0")
-                    self.end_headers()
-                    return
-                path = self.path.split("?", 1)[0]
-                if path == "/health":
-                    self._send_bytes(
-                        json.dumps({"status": "ok", "peer_id": peer_id}).encode(),
-                        "application/json",
-                    )
-                    return
-                if path == "/manifest.json":
-                    self._send_file(directory / "manifest.json", "application/json")
-                    return
-                if path.startswith("/chunk/") and path.endswith(".chunk"):
-                    name = path.rsplit("/", 1)[-1]
-                    if not name[:-6].isdigit() or len(name[:-6]) > 12:
-                        self.send_error(404)
-                        return
-                    self._send_file(directory / name, "application/octet-stream")
-                    return
-                self.send_error(404)
-
-            def _headers(self, content_type: str, length: int) -> None:
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(length))
+            def _send_json(self, status: int, value: dict[str, object]) -> None:
+                payload = json.dumps(value).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
                 self.send_header("Cache-Control", "no-store")
                 self.send_header("X-Content-Type-Options", "nosniff")
-                self.send_header("Connection", "keep-alive")
-
-            def _send_bytes(self, payload: bytes, content_type: str) -> None:
-                self.send_response(200)
-                self._headers(content_type, len(payload))
                 self.end_headers()
                 self.wfile.write(payload)
 
-            def _send_file(self, path: Path, content_type: str) -> None:
+            def do_GET(self) -> None:
+                if not semaphore.acquire(blocking=False):
+                    self._send_json(503, {"error": "server busy"})
+                    return
                 try:
-                    resolved = path.resolve()
-                    resolved.relative_to(directory)
-                except ValueError:
-                    self.send_error(404)
-                    return
-                if not resolved.is_file():
-                    self.send_error(404)
-                    return
-                self.send_response(200)
-                self._headers(content_type, resolved.stat().st_size)
-                self.end_headers()
-                with resolved.open("rb") as handle:
-                    while True:
-                        block = handle.read(1024 * 1024)
-                        if not block:
-                            break
-                        self.wfile.write(block)
+                    if not self._authorized():
+                        self._send_json(401, {"error": "unauthorized"})
+                        return
+                    if self.path == "/health":
+                        self._send_json(200, {"status": "ok", "peer_id": peer_id})
+                        return
+                    if self.path == "/manifest.json":
+                        manifest_path = chunks_dir / "manifest.json"
+                        if not manifest_path.is_file():
+                            self._send_json(404, {"error": "manifest not found"})
+                            return
+                        payload = manifest_path.read_bytes()
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(payload)))
+                        self.send_header("Cache-Control", "no-store")
+                        self.send_header("X-Content-Type-Options", "nosniff")
+                        self.end_headers()
+                        self.wfile.write(payload)
+                        return
+                    prefix = "/chunk/"
+                    if not self.path.startswith(prefix) or not self.path.endswith(".chunk"):
+                        self._send_json(404, {"error": "not found"})
+                        return
+                    filename = self.path[len(prefix):]
+                    if "/" in filename or "\\" in filename or filename.startswith("."):
+                        self._send_json(404, {"error": "not found"})
+                        return
+                    target = (chunks_dir / filename).resolve()
+                    if chunks_dir not in target.parents or not target.is_file():
+                        self._send_json(404, {"error": "not found"})
+                        return
+                    size = target.stat().st_size
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/octet-stream")
+                    self.send_header("Content-Length", str(size))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.end_headers()
+                    with target.open("rb") as handle:
+                        while block := handle.read(1024 * 1024):
+                            self.wfile.write(block)
+                finally:
+                    semaphore.release()
 
             def log_message(self, format: str, *args: object) -> None:
                 return
 
-        class LimitedThreadingHTTPServer(ThreadingHTTPServer):
-            daemon_threads = True
-            request_queue_size = 32
-
-            def process_request_thread(self, request, client_address):
-                active = getattr(self, "_active", 0)
-                if active >= self.max_connections:
-                    request.close()
-                    return
-                self._active = active + 1
-                try:
-                    super().process_request_thread(request, client_address)
-                finally:
-                    self._active -= 1
-
-        LimitedThreadingHTTPServer.max_connections = self.max_connections
-        server = LimitedThreadingHTTPServer((self.host, self.port), Handler)
+        self._httpd = ThreadingHTTPServer((self.host, self.port), Handler)
+        self._httpd.daemon_threads = True
+        self._httpd.allow_reuse_address = True
+        self.port = self._httpd.server_address[1]
         if self.certfile and self.keyfile:
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.minimum_version = ssl.TLSVersion.TLSv1_2
             context.load_cert_chain(self.certfile, self.keyfile)
-            server.socket = context.wrap_socket(server.socket, server_side=True)
-        self._server = server
-        self.port = server.server_address[1]
-        return server
+            self._httpd.socket = context.wrap_socket(self._httpd.socket, server_side=True)
+        return self._httpd
 
     def serve_forever(self) -> None:
-        server = self.start()
-        scheme = "https" if self.certfile else "http"
-        print(f"FluxWave peer listening on {scheme}://{self.host}:{self.port}")
-        try:
-            server.serve_forever()
-        finally:
-            server.server_close()
+        if self._httpd is None:
+            self.start()
+        assert self._httpd is not None
+        self._httpd.serve_forever()
 
     def shutdown(self) -> None:
-        if self._server is not None:
-            self._server.shutdown()
-            self._server.server_close()
+        if self._httpd is not None:
+            self._httpd.shutdown()
+            self._httpd.server_close()
 
 
 def _verify_existing(path: Path, expected_digest: str) -> bool:
@@ -329,12 +300,27 @@ def _verify_existing(path: Path, expected_digest: str) -> bool:
         return False
     digest = hashlib.sha256()
     with path.open("rb") as handle:
-        while True:
-            block = handle.read(1024 * 1024)
-            if not block:
-                break
+        while block := handle.read(1024 * 1024):
             digest.update(block)
     return digest.hexdigest() == expected_digest
+
+
+def _load_manifest_from_peer(
+    peer: PeerEndpoint,
+    *,
+    timeout: float,
+    verify_tls: bool,
+    auth_token: str | None,
+) -> dict[str, object] | None:
+    try:
+        return PersistentPeerClient(
+            peer.base_url,
+            timeout=timeout,
+            verify_tls=verify_tls,
+            auth_token=auth_token,
+        ).get_json("/manifest.json")
+    except Exception:
+        return None
 
 
 def download_from_peers(
@@ -357,18 +343,19 @@ def download_from_peers(
     output.mkdir(parents=True, exist_ok=True)
     normalized = list({peer.peer_id: peer for peer in peers}.values())
 
-    manifest = None
-    for peer in normalized:
-        try:
-            manifest = PersistentPeerClient(
-                peer.base_url,
+    manifest = next(
+        (
+            candidate
+            for peer in normalized
+            if (candidate := _load_manifest_from_peer(
+                peer,
                 timeout=timeout,
                 verify_tls=verify_tls,
                 auth_token=auth_token,
-            ).get_json("/manifest.json")
-            break
-        except Exception:
-            continue
+            )) is not None
+        ),
+        None,
+    )
     if manifest is None:
         raise ConnectionError("no peer could provide a manifest")
     if not isinstance(manifest.get("chunks"), list) or len(manifest["chunks"]) > MAX_MANIFEST_CHUNKS:
@@ -383,10 +370,6 @@ def download_from_peers(
     ]
 
     stats = {peer.peer_id: PeerStats(peer.peer_id) for peer in normalized}
-    controllers = {
-        peer.peer_id: CongestionController(min(2, workers_per_peer), workers_per_peer)
-        for peer in normalized
-    }
     clients = {
         peer.peer_id: PersistentPeerClient(
             peer.base_url,
@@ -396,44 +379,49 @@ def download_from_peers(
         )
         for peer in normalized
     }
+    controllers = {
+        peer.peer_id: CongestionController(1, workers_per_peer)
+        for peer in normalized
+    }
+    lock = threading.Lock()
+    job_iter = iter(jobs)
 
-    def fetch(job: tuple[int, str]) -> None:
-        index, digest = job
-        tried: set[str] = set()
-        last_error: Exception | None = None
-        for _ in range(max_retries):
-            choices = [p for p in normalized if p.peer_id not in tried] or normalized
-            peer = min(
-                choices,
-                key=lambda p: (stats[p.peer_id].failures, -stats[p.peer_id].throughput_mbps),
-            )
-            tried.add(peer.peer_id)
-            controllers[peer.peer_id].acquire()
+    def worker(peer: PeerEndpoint) -> None:
+        client = clients[peer.peer_id]
+        controller = controllers[peer.peer_id]
+        while True:
+            with lock:
+                try:
+                    index, digest = next(job_iter)
+                except StopIteration:
+                    return
+            destination = output / f"{index:06d}.chunk"
+            controller.acquire()
             started = time.monotonic()
             try:
-                received = clients[peer.peer_id].download_chunk(
-                    index, digest, output / f"{index:06d}.chunk"
-                )
-                elapsed = max(time.monotonic() - started, 1e-9)
-                stats[peer.peer_id].successes += 1
-                stats[peer.peer_id].bytes_received += received
-                stats[peer.peer_id].elapsed_seconds += elapsed
-                controllers[peer.peer_id].success()
-                return
-            except Exception as exc:
-                last_error = exc
-                stats[peer.peer_id].failures += 1
-                controllers[peer.peer_id].failure()
-        raise RuntimeError(f"chunk {index} failed after {max_retries} attempts") from last_error
+                received = client.download_chunk(index, digest, destination)
+            except Exception:
+                with lock:
+                    stats[peer.peer_id].failures += 1
+                controller.failure()
+            else:
+                elapsed = time.monotonic() - started
+                with lock:
+                    stats[peer.peer_id].successes += 1
+                    stats[peer.peer_id].bytes_received += received
+                    stats[peer.peer_id].elapsed_seconds += elapsed
+                controller.success()
 
-    with ThreadPoolExecutor(max_workers=max(1, len(normalized) * workers_per_peer)) as pool:
-        futures = [pool.submit(fetch, job) for job in jobs]
+    with ThreadPoolExecutor(max_workers=len(normalized) * workers_per_peer) as executor:
+        futures = [
+            executor.submit(worker, peer)
+            for peer in normalized
+            for _ in range(workers_per_peer)
+        ]
         for future in as_completed(futures):
             future.result()
 
+    remaining = [index for index, digest in jobs if not _verify_existing(output / f"{index:06d}.chunk", digest)]
+    if remaining:
+        raise ConnectionError(f"failed to download {len(remaining)} chunks")
     return stats
-
-
-def download_from_peer(base_url: str, output_dir: str | Path, *, workers: int = 4) -> Path:
-    download_from_peers([PeerEndpoint("peer-0", base_url)], output_dir, workers_per_peer=workers)
-    return Path(output_dir) / "manifest.json"

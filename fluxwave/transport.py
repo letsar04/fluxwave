@@ -5,14 +5,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import hashlib
 import json
 from pathlib import Path
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 from urllib.parse import urlparse
 
 
 class FluxWaveHTTPServer:
-    """Minimal authenticated-by-token-free HTTP peer for verified chunk transfer.
+    """Minimal HTTP peer for verified chunk transfer.
 
-    This first transport intentionally uses the Python standard library. It is
-    suitable for LAN experiments; TLS/authentication are separate production work.
+    Designed for LAN experiments. HTTPS should be placed in front of this
+    transport for untrusted networks.
     """
 
     def __init__(self, chunks_dir: str | Path, host: str = "0.0.0.0", port: int = 8765):
@@ -27,7 +29,7 @@ class FluxWaveHTTPServer:
             def do_GET(self) -> None:
                 parsed = urlparse(self.path)
                 if parsed.path == "/manifest.json":
-                    self._send_manifest(directory / "manifest.json")
+                    self._send_file(directory / "manifest.json", "application/json")
                     return
 
                 if parsed.path.startswith("/chunk/") and parsed.path.endswith(".chunk"):
@@ -35,29 +37,18 @@ class FluxWaveHTTPServer:
                     if not name[:-6].isdigit():
                         self.send_error(404)
                         return
-                    self._send_chunk(directory / name)
+                    self._send_file(directory / name, "application/octet-stream")
                     return
 
                 self.send_error(404)
 
-            def _send_manifest(self, path: Path) -> None:
+            def _send_file(self, path: Path, content_type: str) -> None:
                 if not path.is_file():
                     self.send_error(404)
                     return
                 payload = path.read_bytes()
                 self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(payload)))
-                self.end_headers()
-                self.wfile.write(payload)
-
-            def _send_chunk(self, path: Path) -> None:
-                if not path.is_file():
-                    self.send_error(404)
-                    return
-                payload = path.read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
                 self.wfile.write(payload)
@@ -71,9 +62,13 @@ class FluxWaveHTTPServer:
 
 
 def _download(url: str) -> bytes:
-    from urllib.request import urlopen
-
     with urlopen(url, timeout=60) as response:
+        return response.read()
+
+
+def _download_range(url: str, start: int, end: int) -> bytes:
+    request = Request(url, headers={"Range": f"bytes={start}-{end}"})
+    with urlopen(request, timeout=60) as response:
         return response.read()
 
 
@@ -83,20 +78,22 @@ def download_from_peer(
     *,
     workers: int = 4,
 ) -> Path:
-    """Download missing chunks from a peer and verify every SHA-256 digest."""
+    """Download missing chunks in parallel and verify each SHA-256 digest.
+
+    Existing verified chunks are skipped, making interrupted downloads resumable.
+    """
     if workers <= 0:
         raise ValueError("workers must be positive")
 
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
-
     base = base_url.rstrip("/")
-    manifest = json.loads(_download(f"{base}/manifest.json").decode("utf-8"))
 
+    manifest = json.loads(_download(f"{base}/manifest.json").decode("utf-8"))
     manifest_path = output / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
-    jobs = []
+    jobs: list[tuple[int, str]] = []
     for index, expected_digest in enumerate(manifest["chunks"]):
         path = output / f"{index:06d}.chunk"
         if path.is_file():
@@ -108,10 +105,13 @@ def download_from_peer(
 
     def fetch(item: tuple[int, str]) -> int:
         index, expected_digest = item
-        payload = _download(f"{base}/chunk/{index:06d}.chunk")
+        url = f"{base}/chunk/{index:06d}.chunk"
+        payload = _download(url)
         if hashlib.sha256(payload).hexdigest() != expected_digest:
             raise ValueError(f"checksum mismatch for chunk {index}")
-        (output / f"{index:06d}.chunk").write_bytes(payload)
+        temporary = output / f".{index:06d}.chunk.part"
+        temporary.write_bytes(payload)
+        temporary.replace(output / f"{index:06d}.chunk")
         return index
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -119,4 +119,4 @@ def download_from_peer(
         for future in as_completed(futures):
             future.result()
 
-    return output / "manifest.json"
+    return manifest_path

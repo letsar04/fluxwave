@@ -8,11 +8,7 @@ from .state import DestinationState
 
 @dataclass(frozen=True)
 class ReconstructionRule:
-    """Logical rule describing how a target fragment can be synthesized.
-
-    The rule is intentionally codec-agnostic: it models planning cost before
-    any byte-level reconstruction implementation is selected.
-    """
+    """Logical rule describing how a target fragment can be synthesized."""
 
     target_fragment: str
     source_fragments: tuple[str, ...]
@@ -57,7 +53,9 @@ class ReconstructionGraph:
         destination: DestinationState,
         fragments: dict[str, int],
         peers: list[PeerState],
+        source_candidates: dict[str, list[FragmentCandidate]] | None = None,
     ) -> ReconstructionDecision | None:
+        """Choose the cheapest feasible direct or recursive strategy."""
         peer_map = {peer.peer_id: peer for peer in peers}
         direct_options = []
         for candidate in direct_candidates:
@@ -73,9 +71,15 @@ class ReconstructionGraph:
             cost, _ = min(direct_options, key=lambda item: item[0])
             best = ReconstructionDecision(target_fragment, "direct", cost)
 
+        candidates_by_fragment = source_candidates or {}
         for rule in self.rules_for(target_fragment):
             cost, transfers = self._rule_cost(
-                rule, destination, fragments, peers, set()
+                rule,
+                destination,
+                fragments,
+                candidates_by_fragment,
+                peers,
+                set(),
             )
             if cost == float("inf"):
                 continue
@@ -96,6 +100,7 @@ class ReconstructionGraph:
         rule: ReconstructionRule,
         destination: DestinationState,
         fragments: dict[str, int],
+        source_candidates: dict[str, list[FragmentCandidate]],
         peers: list[PeerState],
         visiting: set[str],
     ) -> tuple[float, list[str]]:
@@ -110,24 +115,34 @@ class ReconstructionGraph:
             if source_id in destination.available_fragments:
                 continue
 
-            nested_rules = self.rules_for(source_id)
-            best_source_cost = float("inf")
-            best_source_transfers: list[str] = []
-
-            for nested in nested_rules:
-                nested_cost, nested_transfers = self._rule_cost(
-                    nested, destination, fragments, peers, visiting
+            nested_cost = float("inf")
+            nested_transfers: list[str] = []
+            for nested in self.rules_for(source_id):
+                cost, nested_result = self._rule_cost(
+                    nested,
+                    destination,
+                    fragments,
+                    source_candidates,
+                    peers,
+                    visiting,
                 )
-                if nested_cost < best_source_cost:
-                    best_source_cost = nested_cost
-                    best_source_transfers = nested_transfers
+                if cost < nested_cost:
+                    nested_cost = cost
+                    nested_transfers = nested_result
 
-            size = fragments.get(source_id)
-            if size is None:
+            best_source_cost = nested_cost
+            best_source_transfers = nested_transfers
+
+            if source_id not in fragments:
                 return float("inf"), []
 
-            for peer in peers:
-                candidate = FragmentCandidate(source_id, peer.peer_id, size)
+            for candidate in source_candidates.get(source_id, []):
+                peer = next(
+                    (item for item in peers if item.peer_id == candidate.peer_id),
+                    None,
+                )
+                if peer is None:
+                    continue
                 direct_cost = expected_transfer_cost(candidate, peer)
                 if direct_cost < best_source_cost:
                     best_source_cost = direct_cost

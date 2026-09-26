@@ -8,7 +8,7 @@ class PeerState:
     peer_id: str
     bandwidth_mbps: float
     latency_ms: float
-    failure_probability: float
+    failure_probability: float = 0.0
 
 
 @dataclass(frozen=True)

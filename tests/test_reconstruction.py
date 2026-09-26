@@ -20,6 +20,10 @@ def test_direct_transfer_wins_when_it_is_cheaper():
         DestinationState(frozenset()),
         {"f1": 1_000_000, "f2": 1_000_000, "f3": 1_000_000},
         peers(),
+        {
+            "f1": [FragmentCandidate("f1", "fast", 1_000_000)],
+            "f2": [FragmentCandidate("f2", "fast", 1_000_000)],
+        },
     )
 
     assert decision is not None
@@ -52,8 +56,18 @@ def test_nested_dependency_is_planned():
         "f3",
         [],
         DestinationState(frozenset({"f0"})),
-        {"f0": 1_000_000, "f1": 1_000_000, "f2": 1_000_000, "f3": 1_000_000, "f4": 1_000_000},
+        {
+            "f0": 1_000_000,
+            "f1": 1_000_000,
+            "f2": 1_000_000,
+            "f3": 1_000_000,
+            "f4": 1_000_000,
+        },
         peers(),
+        {
+            "f1": [FragmentCandidate("f1", "fast", 1_000_000)],
+            "f4": [FragmentCandidate("f4", "fast", 1_000_000)],
+        },
     )
 
     assert decision is not None
@@ -61,7 +75,7 @@ def test_nested_dependency_is_planned():
     assert set(decision.transfer_fragments) == {"f1", "f4"}
 
 
-def test_cycle_is_rejected_as_unusable():
+def test_cycle_is_unresolved():
     graph = ReconstructionGraph()
     graph.register(ReconstructionRule("a", ("b",)))
     graph.register(ReconstructionRule("b", ("a",)))
@@ -74,5 +88,4 @@ def test_cycle_is_rejected_as_unusable():
         peers(),
     )
 
-    assert decision is not None
-    assert decision.strategy == "direct" or decision.cost_seconds != float("inf")
+    assert decision is None

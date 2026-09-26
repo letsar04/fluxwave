@@ -2,6 +2,7 @@ import json
 import threading
 
 from fluxwave.core.file_transfer import reconstruct_file, split_file
+from fluxwave.core.manifest import FileManifest
 from fluxwave.transport import (
     FluxWaveHTTPServer,
     PeerEndpoint,

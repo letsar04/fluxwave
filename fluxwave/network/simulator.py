@@ -54,7 +54,9 @@ def simulate_transfer(
     if max_attempts <= 0:
         raise ValueError("max_attempts must be positive")
 
-    generator = rng or random.Random()
+    # This PRNG is simulation-only; it never generates credentials, keys, tokens,
+    # nonces, or any other security-sensitive material. nosec B311.
+    generator = rng or random.Random()  # nosec B311
     one_attempt = transfer_time_seconds(size_bytes, peer)
     attempts = 0
     failures = 0

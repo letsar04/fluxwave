@@ -19,18 +19,34 @@ class FragmentCandidate:
     reconstruction_gain: float = 1.0
 
 
-def transfer_cost(candidate: FragmentCandidate, peer: PeerState) -> float:
-    """Estimate normalized cost; lower is better."""
+def expected_attempts(peer: PeerState) -> float:
+    """Expected number of attempts under independent failure."""
+    if not 0 <= peer.failure_probability < 1:
+        return float("inf")
+    return 1.0 / (1.0 - peer.failure_probability)
+
+
+def transfer_time(candidate: FragmentCandidate, peer: PeerState) -> float:
     if peer.bandwidth_mbps <= 0:
         return float("inf")
-    seconds = candidate.size_bytes * 8 / (peer.bandwidth_mbps * 1_000_000)
-    failure_multiplier = 1.0 + max(0.0, peer.failure_probability)
-    return (seconds + peer.latency_ms / 1000.0) * failure_multiplier
+    return candidate.size_bytes * 8 / (peer.bandwidth_mbps * 1_000_000) + peer.latency_ms / 1000.0
+
+
+def expected_transfer_cost(candidate: FragmentCandidate, peer: PeerState) -> float:
+    """Expected wall-clock cost including retransmission risk."""
+    base = transfer_time(candidate, peer)
+    attempts = expected_attempts(peer)
+    return base * attempts if attempts != float("inf") else float("inf")
+
+
+def transfer_cost(candidate: FragmentCandidate, peer: PeerState) -> float:
+    """Backward-compatible alias for the expected cost."""
+    return expected_transfer_cost(candidate, peer)
 
 
 def score(candidate: FragmentCandidate, peer: PeerState) -> float:
-    """WARP score: higher means a more attractive transfer candidate."""
-    cost = transfer_cost(candidate, peer)
+    """WARP score: expected reconstruction gain per expected second."""
+    cost = expected_transfer_cost(candidate, peer)
     if cost == float("inf"):
         return 0.0
     return candidate.reconstruction_gain / cost

@@ -45,7 +45,7 @@ def test_real_http_download_and_resume(tmp_path):
         assert chunk.read_bytes() == before
 
         restored = tmp_path / "restored.bin"
-        reconstruct_file(output, __import__("fluxwave.core.manifest", fromlist=["FileManifest"]).FileManifest.from_dict(manifest), restored)
+        reconstruct_file(output, FileManifest.from_dict(manifest), restored)
         assert restored.read_bytes() == source.read_bytes()
     finally:
         server.shutdown()

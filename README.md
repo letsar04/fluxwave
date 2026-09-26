@@ -63,7 +63,14 @@ PersistentPeerClient uses HTTP/1.1 keep-alive and retains one connection per wor
 
 ## TLS
 
-A peer can run with a certificate and private key:
+For a local test certificate, OpenSSL can generate one with:
+
+~~~bash
+openssl req -x509 -newkey rsa:2048 -nodes -days 30 \\
+  -keyout server.key -out server.crt -subj "/CN=fluxwave"
+~~~
+
+A peer can then run with the certificate and private key:
 
 ~~~bash
 fluxwave serve ./chunks --host 0.0.0.0 --port 8765 \

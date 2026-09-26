@@ -42,16 +42,27 @@ class CongestionController:
             raise ValueError("invalid congestion window")
         self.window = initial_window
         self.max_window = max_window
-        self._lock = threading.Lock()
+        self.active = 0
+        self._condition = threading.Condition()
+
+    def acquire(self) -> None:
+        with self._condition:
+            while self.active >= self.window:
+                self._condition.wait()
+            self.active += 1
 
     def success(self) -> int:
-        with self._lock:
+        with self._condition:
+            self.active -= 1
             self.window = min(self.max_window, self.window + 1)
+            self._condition.notify_all()
             return self.window
 
     def failure(self) -> int:
-        with self._lock:
+        with self._condition:
+            self.active -= 1
             self.window = max(1, self.window // 2)
+            self._condition.notify_all()
             return self.window
 
 
@@ -316,6 +327,7 @@ def download_from_peers(
                 ),
             )
             tried.add(peer.peer_id)
+            controllers[peer.peer_id].acquire()
             started = time.monotonic()
             try:
                 received = clients[peer.peer_id].download_chunk(

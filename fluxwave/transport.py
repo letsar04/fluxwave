@@ -13,16 +13,13 @@ import threading
 import time
 from urllib.parse import urlparse
 
-
 MAX_MANIFEST_CHUNKS = 1_000_000
 MAX_PEER_ID_LENGTH = 128
-
 
 @dataclass(frozen=True)
 class PeerEndpoint:
     peer_id: str
     base_url: str
-
 
 @dataclass
 class PeerStats:
@@ -31,17 +28,14 @@ class PeerStats:
     failures: int = 0
     bytes_received: int = 0
     elapsed_seconds: float = 0.0
-
     @property
     def throughput_mbps(self) -> float:
         if self.elapsed_seconds <= 0:
             return 0.0
         return self.bytes_received * 8 / self.elapsed_seconds / 1_000_000
 
-
 class CongestionController:
     """AIMD controller for per-peer application-level concurrency."""
-
     def __init__(self, initial_window: int = 2, max_window: int = 8) -> None:
         if initial_window <= 0 or max_window < initial_window:
             raise ValueError("invalid congestion window")
@@ -49,20 +43,17 @@ class CongestionController:
         self.max_window = max_window
         self.active = 0
         self._condition = threading.Condition()
-
     def acquire(self) -> None:
         with self._condition:
             while self.active >= self.window:
                 self._condition.wait()
             self.active += 1
-
     def success(self) -> int:
         with self._condition:
             self.active -= 1
             self.window = min(self.max_window, self.window + 1)
             self._condition.notify_all()
             return self.window
-
     def failure(self) -> int:
         with self._condition:
             self.active -= 1
@@ -70,18 +61,9 @@ class CongestionController:
             self._condition.notify_all()
             return self.window
 
-
 class PersistentPeerClient:
     """HTTP/1.1 client retaining one connection per worker thread."""
-
-    def __init__(
-        self,
-        base_url: str,
-        *,
-        timeout: float = 60.0,
-        verify_tls: bool = True,
-        auth_token: str | None = None,
-    ) -> None:
+    def __init__(self, base_url: str, *, timeout: float = 60.0, verify_tls: bool = True, auth_token: str | None = None) -> None:
         parsed = urlparse(base_url.rstrip("/"))
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("peer URL must use http:// or https://")
@@ -93,7 +75,6 @@ class PersistentPeerClient:
         self.verify_tls = verify_tls
         self.auth_token = auth_token
         self._local = threading.local()
-
     def _connection(self):
         connection = getattr(self._local, "connection", None)
         if connection is not None:
@@ -103,21 +84,11 @@ class PersistentPeerClient:
             if not self.verify_tls:
                 context.check_hostname = False
                 context.verify_mode = ssl.CERT_NONE
-            connection = http.client.HTTPSConnection(
-                self.parsed.hostname,
-                self.parsed.port,
-                timeout=self.timeout,
-                context=context,
-            )
+            connection = http.client.HTTPSConnection(self.parsed.hostname, self.parsed.port, timeout=self.timeout, context=context)
         else:
-            connection = http.client.HTTPConnection(
-                self.parsed.hostname,
-                self.parsed.port,
-                timeout=self.timeout,
-            )
+            connection = http.client.HTTPConnection(self.parsed.hostname, self.parsed.port, timeout=self.timeout)
         self._local.connection = connection
         return connection
-
     def _request(self, path: str):
         if not path.startswith("/") or ".." in path.split("/"):
             raise ValueError("invalid peer path")
@@ -136,14 +107,15 @@ class PersistentPeerClient:
             connection.close()
             self._local.connection = None
             raise
-
     def get_json(self, path: str) -> dict[str, object]:
         response = self._request(path)
         try:
-            return json.loads(response.read().decode("utf-8"))
+            value = json.loads(response.read().decode("utf-8"))
+            if not isinstance(value, dict):
+                raise ValueError("peer JSON response must be an object")
+            return value
         finally:
             response.close()
-
     def download_chunk(self, index: int, expected_digest: str, destination: Path) -> int:
         response = self._request(f"/chunk/{index:06d}.chunk")
         temporary = destination.with_name(f".{destination.name}.part")
@@ -166,22 +138,9 @@ class PersistentPeerClient:
         finally:
             response.close()
 
-
 class FluxWaveHTTPServer:
     """HTTP/1.1 peer with optional TLS and bearer-token authentication."""
-
-    def __init__(
-        self,
-        chunks_dir: str | Path,
-        host: str = "127.0.0.1",
-        port: int = 8765,
-        *,
-        peer_id: str = "fluxwave-peer",
-        certfile: str | Path | None = None,
-        keyfile: str | Path | None = None,
-        auth_token: str | None = None,
-        max_connections: int = 64,
-    ) -> None:
+    def __init__(self, chunks_dir: str | Path, host: str = "127.0.0.1", port: int = 8765, *, peer_id: str = "fluxwave-peer", certfile: str | Path | None = None, keyfile: str | Path | None = None, auth_token: str | None = None, max_connections: int = 64) -> None:
         self.chunks_dir = Path(chunks_dir).resolve()
         self.host = host
         self.port = port
@@ -192,23 +151,18 @@ class FluxWaveHTTPServer:
         self.max_connections = max_connections
         self._httpd: ThreadingHTTPServer | None = None
         self._semaphore = threading.BoundedSemaphore(max_connections)
-
     def start(self) -> ThreadingHTTPServer:
         chunks_dir = self.chunks_dir
         peer_id = self.peer_id
         auth_token = self.auth_token
         semaphore = self._semaphore
-
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
-
             def _authorized(self) -> bool:
                 if auth_token is None:
                     return True
                 presented = self.headers.get("Authorization", "")
-                expected = f"Bearer {auth_token}"
-                return hmac.compare_digest(presented, expected)
-
+                return hmac.compare_digest(presented, f"Bearer {auth_token}")
             def _send_json(self, status: int, value: dict[str, object]) -> None:
                 payload = json.dumps(value).encode("utf-8")
                 self.send_response(status)
@@ -218,7 +172,6 @@ class FluxWaveHTTPServer:
                 self.send_header("X-Content-Type-Options", "nosniff")
                 self.end_headers()
                 self.wfile.write(payload)
-
             def do_GET(self) -> None:
                 if not semaphore.acquire(blocking=False):
                     self._send_json(503, {"error": "server busy"})
@@ -268,10 +221,8 @@ class FluxWaveHTTPServer:
                             self.wfile.write(block)
                 finally:
                     semaphore.release()
-
             def log_message(self, format: str, *args: object) -> None:
                 return
-
         self._httpd = ThreadingHTTPServer((self.host, self.port), Handler)
         self._httpd.daemon_threads = True
         self._httpd.allow_reuse_address = True
@@ -282,18 +233,15 @@ class FluxWaveHTTPServer:
             context.load_cert_chain(self.certfile, self.keyfile)
             self._httpd.socket = context.wrap_socket(self._httpd.socket, server_side=True)
         return self._httpd
-
     def serve_forever(self) -> None:
         if self._httpd is None:
             self.start()
         assert self._httpd is not None
         self._httpd.serve_forever()
-
     def shutdown(self) -> None:
         if self._httpd is not None:
             self._httpd.shutdown()
             self._httpd.server_close()
-
 
 def _verify_existing(path: Path, expected_digest: str) -> bool:
     if not path.is_file():
@@ -304,88 +252,41 @@ def _verify_existing(path: Path, expected_digest: str) -> bool:
             digest.update(block)
     return digest.hexdigest() == expected_digest
 
-
-def _load_manifest_from_peer(
-    peer: PeerEndpoint,
-    *,
-    timeout: float,
-    verify_tls: bool,
-    auth_token: str | None,
-) -> dict[str, object] | None:
+def _load_manifest_from_peer(peer: PeerEndpoint, *, timeout: float, verify_tls: bool, auth_token: str | None) -> dict[str, object] | None:
     try:
-        return PersistentPeerClient(
-            peer.base_url,
-            timeout=timeout,
-            verify_tls=verify_tls,
-            auth_token=auth_token,
-        ).get_json("/manifest.json")
+        return PersistentPeerClient(peer.base_url, timeout=timeout, verify_tls=verify_tls, auth_token=auth_token).get_json("/manifest.json")
     except Exception:
         return None
 
+def download_from_peer(base_url: str, output_dir: str | Path, *, workers: int = 2, timeout: float = 60.0, verify_tls: bool = True, auth_token: str | None = None) -> dict[str, PeerStats]:
+    """Backward-compatible single-peer wrapper around the multi-peer engine."""
+    if workers <= 0:
+        raise ValueError("workers must be positive")
+    return download_from_peers([PeerEndpoint("peer-0", base_url)], output_dir, workers_per_peer=workers, timeout=timeout, verify_tls=verify_tls, auth_token=auth_token)
 
-def download_from_peers(
-    peers: list[PeerEndpoint],
-    output_dir: str | Path,
-    *,
-    workers_per_peer: int = 2,
-    max_retries: int = 3,
-    timeout: float = 60.0,
-    verify_tls: bool = True,
-    auth_token: str | None = None,
-) -> dict[str, PeerStats]:
+def download_from_peers(peers: list[PeerEndpoint], output_dir: str | Path, *, workers_per_peer: int = 2, max_retries: int = 3, timeout: float = 60.0, verify_tls: bool = True, auth_token: str | None = None) -> dict[str, PeerStats]:
     """Resume across peers and retry failed chunks on another peer."""
     if not peers:
         raise ValueError("at least one peer is required")
     if workers_per_peer <= 0 or max_retries <= 0:
         raise ValueError("workers_per_peer and max_retries must be positive")
-
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     normalized = list({peer.peer_id: peer for peer in peers}.values())
-
-    manifest = next(
-        (
-            candidate
-            for peer in normalized
-            if (candidate := _load_manifest_from_peer(
-                peer,
-                timeout=timeout,
-                verify_tls=verify_tls,
-                auth_token=auth_token,
-            )) is not None
-        ),
-        None,
-    )
+    manifest = next((candidate for peer in normalized if (candidate := _load_manifest_from_peer(peer, timeout=timeout, verify_tls=verify_tls, auth_token=auth_token)) is not None), None)
     if manifest is None:
         raise ConnectionError("no peer could provide a manifest")
-    if not isinstance(manifest.get("chunks"), list) or len(manifest["chunks"]) > MAX_MANIFEST_CHUNKS:
+    chunks = manifest.get("chunks")
+    if not isinstance(chunks, list) or len(chunks) > MAX_MANIFEST_CHUNKS:
         raise ValueError("peer manifest is invalid or too large")
-
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
-    expected = [str(item) for item in manifest["chunks"]]
-    jobs = [
-        (i, digest)
-        for i, digest in enumerate(expected)
-        if not _verify_existing(output / f"{i:06d}.chunk", digest)
-    ]
-
+    expected = [str(item) for item in chunks]
+    jobs = [(i, digest) for i, digest in enumerate(expected) if not _verify_existing(output / f"{i:06d}.chunk", digest)]
     stats = {peer.peer_id: PeerStats(peer.peer_id) for peer in normalized}
-    clients = {
-        peer.peer_id: PersistentPeerClient(
-            peer.base_url,
-            timeout=timeout,
-            verify_tls=verify_tls,
-            auth_token=auth_token,
-        )
-        for peer in normalized
-    }
-    controllers = {
-        peer.peer_id: CongestionController(1, workers_per_peer)
-        for peer in normalized
-    }
+    clients = {peer.peer_id: PersistentPeerClient(peer.base_url, timeout=timeout, verify_tls=verify_tls, auth_token=auth_token) for peer in normalized}
+    controllers = {peer.peer_id: CongestionController(1, workers_per_peer) for peer in normalized}
     lock = threading.Lock()
     job_iter = iter(jobs)
-
     def worker(peer: PeerEndpoint) -> None:
         client = clients[peer.peer_id]
         controller = controllers[peer.peer_id]
@@ -411,16 +312,10 @@ def download_from_peers(
                     stats[peer.peer_id].bytes_received += received
                     stats[peer.peer_id].elapsed_seconds += elapsed
                 controller.success()
-
     with ThreadPoolExecutor(max_workers=len(normalized) * workers_per_peer) as executor:
-        futures = [
-            executor.submit(worker, peer)
-            for peer in normalized
-            for _ in range(workers_per_peer)
-        ]
+        futures = [executor.submit(worker, peer) for peer in normalized for _ in range(workers_per_peer)]
         for future in as_completed(futures):
             future.result()
-
     remaining = [index for index, digest in jobs if not _verify_existing(output / f"{index:06d}.chunk", digest)]
     if remaining:
         raise ConnectionError(f"failed to download {len(remaining)} chunks")

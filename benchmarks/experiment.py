@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import random
 import statistics
+import math
 
 from benchmarks.oracle import oracle_schedule
 from benchmarks.strategies import fastest_schedule, random_schedule
@@ -23,7 +24,12 @@ class Measurement:
 
 def percentile(values: list[float], q: float) -> float:
     values = sorted(values)
-    return values[min(len(values) - 1, int((len(values) - 1) * q))]
+    if not values:
+        raise ValueError("values cannot be empty")
+    if not 0 <= q <= 1:
+        raise ValueError("q must be between 0 and 1")
+    rank = max(1, math.ceil(q * len(values))) - 1
+    return values[min(len(values) - 1, rank)]
 
 
 def build_scenario(rng: random.Random, name: str):

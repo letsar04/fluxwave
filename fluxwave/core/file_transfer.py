@@ -9,17 +9,28 @@ from .manifest import FileManifest, save_manifest
 
 def build_manifest(path: str | Path, chunk_size: int) -> FileManifest:
     source = Path(path)
-    data = source.read_bytes()
-    chunks = [
-        sha256(data[offset : offset + chunk_size]).hexdigest()
-        for offset in range(0, len(data), chunk_size)
-    ]
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+
+    file_hash = sha256()
+    chunks: list[str] = []
+    total = 0
+
+    with source.open("rb") as handle:
+        while True:
+            payload = handle.read(chunk_size)
+            if not payload:
+                break
+            chunks.append(sha256(payload).hexdigest())
+            file_hash.update(payload)
+            total += len(payload)
+
     return FileManifest(
         filename=source.name,
-        size_bytes=len(data),
+        size_bytes=total,
         chunk_size=chunk_size,
         chunks=tuple(chunks),
-        file_digest=sha256(data).hexdigest(),
+        file_digest=file_hash.hexdigest(),
     )
 
 
@@ -28,11 +39,18 @@ def split_file(path: str | Path, output_dir: str | Path, chunk_size: int) -> Fil
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
 
-    data = source.read_bytes()
     manifest = build_manifest(source, chunk_size)
 
-    for index, offset in enumerate(range(0, len(data), chunk_size)):
-        (output / f"{index:06d}.chunk").write_bytes(data[offset : offset + chunk_size])
+    with source.open("rb") as handle:
+        index = 0
+        while True:
+            payload = handle.read(chunk_size)
+            if not payload:
+                break
+            temporary = output / f".{index:06d}.chunk.part"
+            temporary.write_bytes(payload)
+            temporary.replace(output / f"{index:06d}.chunk")
+            index += 1
 
     save_manifest(manifest, output / "manifest.json")
     return manifest
@@ -58,18 +76,32 @@ def reconstruct_file(
 ) -> Path:
     directory = Path(chunks_dir)
     output = Path(output_path)
-    with output.open("wb") as handle:
-        for digest in manifest.chunks:
-            matches = [
-                path
-                for path in directory.glob("*.chunk")
-                if sha256(path.read_bytes()).hexdigest() == digest
-            ]
-            if not matches:
-                raise FileNotFoundError(f"missing chunk: {digest}")
-            handle.write(matches[0].read_bytes())
+    output.parent.mkdir(parents=True, exist_ok=True)
 
-    if sha256(output.read_bytes()).hexdigest() != manifest.file_digest:
+    file_hash = sha256()
+    with output.open("wb") as handle:
+        for index, digest in enumerate(manifest.chunks):
+            path = directory / f"{index:06d}.chunk"
+            if not path.is_file():
+                raise FileNotFoundError(f"missing chunk {index}: {digest}")
+
+            chunk_hash = sha256()
+            with path.open("rb") as chunk:
+                while True:
+                    block = chunk.read(1024 * 1024)
+                    if not block:
+                        break
+                    chunk_hash.update(block)
+                    handle.write(block)
+                    file_hash.update(block)
+
+            if chunk_hash.hexdigest() != digest:
+                raise ValueError(f"checksum mismatch for chunk {index}")
+
+    if file_hash.hexdigest() != manifest.file_digest:
         raise ValueError("reconstructed file fingerprint does not match manifest")
+
+    if output.stat().st_size != manifest.size_bytes:
+        raise ValueError("reconstructed file size does not match manifest")
 
     return output

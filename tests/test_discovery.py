@@ -1,6 +1,8 @@
 import threading
 import time
 
+import pytest
+
 from fluxwave.discovery import DiscoveryConfig, advertise, discover
 from fluxwave.transport import PeerEndpoint
 
@@ -17,6 +19,11 @@ def test_multicast_discovery_round_trip():
     thread.start()
     time.sleep(0.1)
 
-    peers = discover(config=config, timeout=1.2)
-    thread.join(timeout=1)
+    try:
+        peers = discover(config=config, timeout=1.2)
+    except OSError as exc:
+        pytest.skip(f"multicast unavailable in test environment: {exc}")
+    finally:
+        thread.join(timeout=1)
+
     assert any(item.peer_id == peer.peer_id for item in peers)

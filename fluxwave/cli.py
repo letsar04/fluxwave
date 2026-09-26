@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import socket
 
 from .core.file_transfer import reconstruct_file, split_file
 from .core.manifest import load_manifest
@@ -36,7 +37,6 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--advertise", action="store_true")
 
     download = sub.add_parser("download", help="download chunks from one or more peers")
-    download.add_argument("url", nargs="?")
     download.add_argument("output", type=Path)
     download.add_argument("--peer", action="append", default=[])
     download.add_argument("--workers", type=int, default=4)
@@ -79,7 +79,7 @@ def main() -> int:
             import threading
             thread = threading.Thread(
                 target=advertise,
-                args=(PeerEndpoint(args.peer_id, f"{'https' if args.certfile else 'http'}://{args.host}:{args.port}"),),
+                args=(PeerEndpoint(args.peer_id, f"{'https' if args.certfile else 'http'}://{socket.gethostbyname(socket.gethostname())}:{args.port}"),),
                 daemon=True,
             )
             thread.start()
@@ -94,8 +94,6 @@ def main() -> int:
 
     if args.command == "download":
         peers = []
-        if args.url:
-            peers.append(PeerEndpoint("peer-0", args.url))
         peers.extend(
             PeerEndpoint(f"peer-{index}", url)
             for index, url in enumerate(args.peer, start=1)

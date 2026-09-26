@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from dataclasses import dataclass
 import hashlib
+import http.client
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
+import ssl
+import threading
+import time
 from urllib.parse import urlparse
 
 
@@ -73,12 +78,16 @@ class PersistentPeerClient:
                 context.check_hostname = False
                 context.verify_mode = ssl.CERT_NONE
             connection = http.client.HTTPSConnection(
-                self.parsed.hostname, self.parsed.port,
-                timeout=self.timeout, context=context,
+                self.parsed.hostname,
+                self.parsed.port,
+                timeout=self.timeout,
+                context=context,
             )
         else:
             connection = http.client.HTTPConnection(
-                self.parsed.hostname, self.parsed.port, timeout=self.timeout
+                self.parsed.hostname,
+                self.parsed.port,
+                timeout=self.timeout,
             )
         self._local.connection = connection
         return connection
@@ -127,54 +136,106 @@ class PersistentPeerClient:
             response.close()
 
 
-    """Minimal HTTP peer for verified chunk transfer.
+class FluxWaveHTTPServer:
+    """HTTP/1.1 peer with streaming responses and optional TLS."""
 
-    Designed for LAN experiments. HTTPS should be placed in front of this
-    transport for untrusted networks.
-    """
-
-    def __init__(self, chunks_dir: str | Path, host: str = "0.0.0.0", port: int = 8765):
+    def __init__(
+        self,
+        chunks_dir: str | Path,
+        host: str = "0.0.0.0",
+        port: int = 8765,
+        *,
+        peer_id: str = "fluxwave-peer",
+        certfile: str | Path | None = None,
+        keyfile: str | Path | None = None,
+    ) -> None:
         self.chunks_dir = Path(chunks_dir)
         self.host = host
         self.port = port
+        self.peer_id = peer_id
+        self.certfile = str(certfile) if certfile else None
+        self.keyfile = str(keyfile) if keyfile else None
+        if bool(self.certfile) != bool(self.keyfile):
+            raise ValueError("certfile and keyfile must be supplied together")
+        self._server: ThreadingHTTPServer | None = None
 
-    def serve_forever(self) -> None:
+    def start(self) -> ThreadingHTTPServer:
         directory = self.chunks_dir
+        peer_id = self.peer_id
 
         class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
             def do_GET(self) -> None:
-                parsed = urlparse(self.path)
-                if parsed.path == "/manifest.json":
+                path = self.path.split("?", 1)[0]
+                if path == "/health":
+                    self._send_bytes(
+                        json.dumps({"status": "ok", "peer_id": peer_id}).encode(),
+                        "application/json",
+                    )
+                    return
+                if path == "/manifest.json":
                     self._send_file(directory / "manifest.json", "application/json")
                     return
-
-                if parsed.path.startswith("/chunk/") and parsed.path.endswith(".chunk"):
-                    name = parsed.path.rsplit("/", 1)[-1]
+                if path.startswith("/chunk/") and path.endswith(".chunk"):
+                    name = path.rsplit("/", 1)[-1]
                     if not name[:-6].isdigit():
                         self.send_error(404)
                         return
                     self._send_file(directory / name, "application/octet-stream")
                     return
-
                 self.send_error(404)
+
+            def _send_bytes(self, payload: bytes, content_type: str) -> None:
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Connection", "keep-alive")
+                self.end_headers()
+                self.wfile.write(payload)
 
             def _send_file(self, path: Path, content_type: str) -> None:
                 if not path.is_file():
                     self.send_error(404)
                     return
-                payload = path.read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Content-Length", str(path.stat().st_size))
+                self.send_header("Connection", "keep-alive")
                 self.end_headers()
-                self.wfile.write(payload)
+                with path.open("rb") as handle:
+                    while True:
+                        block = handle.read(1024 * 1024)
+                        if not block:
+                            break
+                        self.wfile.write(block)
 
             def log_message(self, format: str, *args: object) -> None:
                 return
 
         server = ThreadingHTTPServer((self.host, self.port), Handler)
-        print(f"FluxWave peer listening on http://{self.host}:{self.port}")
-        server.serve_forever()
+        if self.certfile and self.keyfile:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+            context.load_cert_chain(self.certfile, self.keyfile)
+            server.socket = context.wrap_socket(server.socket, server_side=True)
+        self._server = server
+        self.port = server.server_address[1]
+        return server
+
+    def serve_forever(self) -> None:
+        server = self.start()
+        scheme = "https" if self.certfile else "http"
+        print(f"FluxWave peer listening on {scheme}://{self.host}:{self.port}")
+        try:
+            server.serve_forever()
+        finally:
+            server.server_close()
+
+    def shutdown(self) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
 
 
 def _verify_existing(path: Path, expected_digest: str) -> bool:
@@ -199,6 +260,7 @@ def download_from_peers(
     timeout: float = 60.0,
     verify_tls: bool = True,
 ) -> dict[str, PeerStats]:
+    """Resume across peers and retry failed chunks on another peer."""
     if not peers:
         raise ValueError("at least one peer is required")
     if workers_per_peer <= 0 or max_retries <= 0:
@@ -211,7 +273,9 @@ def download_from_peers(
     manifest = None
     for peer in normalized:
         try:
-            manifest = PersistentPeerClient(peer.base_url, timeout=timeout, verify_tls=verify_tls).get_json("/manifest.json")
+            manifest = PersistentPeerClient(
+                peer.base_url, timeout=timeout, verify_tls=verify_tls
+            ).get_json("/manifest.json")
             break
         except Exception:
             continue
@@ -220,11 +284,23 @@ def download_from_peers(
 
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     expected = [str(item) for item in manifest["chunks"]]
-    jobs = [(i, digest) for i, digest in enumerate(expected) if not _verify_existing(output / f"{i:06d}.chunk", digest)]
+    jobs = [
+        (i, digest)
+        for i, digest in enumerate(expected)
+        if not _verify_existing(output / f"{i:06d}.chunk", digest)
+    ]
 
     stats = {peer.peer_id: PeerStats(peer.peer_id) for peer in normalized}
-    controllers = {peer.peer_id: CongestionController(min(2, workers_per_peer), workers_per_peer) for peer in normalized}
-    clients = {peer.peer_id: PersistentPeerClient(peer.base_url, timeout=timeout, verify_tls=verify_tls) for peer in normalized}
+    controllers = {
+        peer.peer_id: CongestionController(min(2, workers_per_peer), workers_per_peer)
+        for peer in normalized
+    }
+    clients = {
+        peer.peer_id: PersistentPeerClient(
+            peer.base_url, timeout=timeout, verify_tls=verify_tls
+        )
+        for peer in normalized
+    }
 
     def fetch(job: tuple[int, str]) -> None:
         index, digest = job
@@ -232,11 +308,19 @@ def download_from_peers(
         last_error: Exception | None = None
         for _ in range(max_retries):
             choices = [p for p in normalized if p.peer_id not in tried] or normalized
-            peer = min(choices, key=lambda p: (stats[p.peer_id].failures, -stats[p.peer_id].throughput_mbps))
+            peer = min(
+                choices,
+                key=lambda p: (
+                    stats[p.peer_id].failures,
+                    -stats[p.peer_id].throughput_mbps,
+                ),
+            )
             tried.add(peer.peer_id)
             started = time.monotonic()
             try:
-                received = clients[peer.peer_id].download_chunk(index, digest, output / f"{index:06d}.chunk")
+                received = clients[peer.peer_id].download_chunk(
+                    index, digest, output / f"{index:06d}.chunk"
+                )
                 elapsed = max(time.monotonic() - started, 1e-9)
                 stats[peer.peer_id].successes += 1
                 stats[peer.peer_id].bytes_received += received
@@ -258,5 +342,9 @@ def download_from_peers(
 
 
 def download_from_peer(base_url: str, output_dir: str | Path, *, workers: int = 4) -> Path:
-    download_from_peers([PeerEndpoint("peer-0", base_url)], output_dir, workers_per_peer=workers)
+    download_from_peers(
+        [PeerEndpoint("peer-0", base_url)],
+        output_dir,
+        workers_per_peer=workers,
+    )
     return Path(output_dir) / "manifest.json"

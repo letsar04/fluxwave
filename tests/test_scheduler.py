@@ -16,7 +16,7 @@ def test_scheduler_assigns_fragments_to_available_peers():
     schedule = schedule_fragments(candidates, peers)
 
     assert len(schedule.fragments) == 3
-    assert {item.peer_id for item in schedule.fragments} == {"fast", "slow"}
+    assert {item.peer_id for item in schedule.fragments} == {"fast"}
     assert schedule.makespan_seconds > 0
 
 

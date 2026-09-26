@@ -4,7 +4,6 @@ from dataclasses import dataclass
 
 from .planner import FragmentCandidate, PeerState, expected_transfer_cost
 
-
 @dataclass(frozen=True)
 class ScheduledFragment:
     fragment_id: str
@@ -13,51 +12,40 @@ class ScheduledFragment:
     finish_seconds: float
     expected_seconds: float
 
-
 @dataclass(frozen=True)
 class Schedule:
     fragments: tuple[ScheduledFragment, ...]
     makespan_seconds: float
 
-
-def schedule_fragments(
-    candidates: list[FragmentCandidate], peers: list[PeerState]
-) -> Schedule:
-    """Greedily minimize the predicted makespan with peer-local availability.
-
-    Each fragment is assigned to the peer that gives the earliest predicted
-    completion time. Ties are broken by lower expected transfer cost, then peer id.
-    This is intentionally a transparent heuristic rather than an exact optimizer.
-    """
+def schedule_fragment_options(options_by_fragment: dict[str, list[FragmentCandidate]], peers: list[PeerState]) -> Schedule:
+    """Schedule each logical fragment exactly once using only valid source peers."""
     peer_map = {peer.peer_id: peer for peer in peers}
     availability = {peer.peer_id: 0.0 for peer in peers}
     scheduled: list[ScheduledFragment] = []
-
-    ordered = sorted(candidates, key=lambda c: c.size_bytes, reverse=True)
-    for candidate in ordered:
+    ordered = sorted(options_by_fragment.items(), key=lambda item: max((c.size_bytes for c in item[1]), default=0), reverse=True)
+    for fragment_id, candidates in ordered:
         options = []
-        for peer_id, available_at in availability.items():
-            peer = peer_map[peer_id]
+        for candidate in candidates:
+            peer = peer_map.get(candidate.peer_id)
+            if peer is None:
+                continue
             cost = expected_transfer_cost(candidate, peer)
             if cost == float("inf"):
                 continue
-            finish = available_at + cost
-            options.append((finish, cost, peer_id, available_at))
-
+            start = availability[peer.peer_id]
+            options.append((start + cost, cost, peer.peer_id, start))
         if not options:
             continue
-
         finish, cost, peer_id, start = min(options)
-        scheduled.append(
-            ScheduledFragment(
-                fragment_id=candidate.fragment_id,
-                peer_id=peer_id,
-                start_seconds=start,
-                finish_seconds=finish,
-                expected_seconds=cost,
-            )
-        )
+        scheduled.append(ScheduledFragment(fragment_id, peer_id, start, finish, cost))
         availability[peer_id] = finish
+    return Schedule(tuple(scheduled), max((item.finish_seconds for item in scheduled), default=0.0))
 
-    makespan = max((item.finish_seconds for item in scheduled), default=0.0)
-    return Schedule(tuple(scheduled), makespan)
+def schedule_fragments(candidates: list[FragmentCandidate], peers: list[PeerState]) -> Schedule:
+    """Backward-compatible scheduler where every peer is a possible source."""
+    options: dict[str, list[FragmentCandidate]] = {}
+    for candidate in candidates:
+        options.setdefault(candidate.fragment_id, []).extend(
+            FragmentCandidate(candidate.fragment_id, peer.peer_id, candidate.size_bytes) for peer in peers
+        )
+    return schedule_fragment_options(options, peers)
